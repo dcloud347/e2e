@@ -1,3 +1,9 @@
+"""项目的 Hydra 结构化配置。
+
+这个文件只定义配置结构和默认值，不负责真正执行训练。
+训练入口会先调用 `register_configs()`，再让 Hydra 把 YAML 配置合并成这些 dataclass。
+"""
+
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -7,6 +13,12 @@ from omegaconf import MISSING
 
 @dataclass(unsafe_hash=True, eq=True)
 class JaxDistributedConfig:
+    """JAX 分布式启动参数。
+
+    单机调试时通常只需要 `backend=gpu/cpu` 和 `num_devices`。
+    多机训练时还需要 coordinator、进程数和当前进程 id。
+    """
+
     distributed: bool = False
     coordinator_address: str | None = None
     num_processes: int | None = None
@@ -19,6 +31,8 @@ class JaxDistributedConfig:
 
 @dataclass(unsafe_hash=True, eq=True)
 class CheckpointConfig:
+    """checkpoint 路径和保存内容设置。"""
+
     float_dtype: str = "bf16"
     save_optimizer_state: bool = True
     checkpoint_dir: str = MISSING
@@ -26,12 +40,20 @@ class CheckpointConfig:
 
 
 class OptimizerType(StrEnum):
+    """项目支持的优化器类型。"""
+
     adamw = "adamw"
     sgd = "sgd"
 
 
 @dataclass(unsafe_hash=True, eq=True)
 class OptimizerConfig:
+    """优化器公共字段。
+
+    具体默认值由 AdamWOptimizerConfig 和 SGDOptimizerConfig 提供。
+    `MISSING` 表示必须由更具体的配置补齐。
+    """
+
     optimizer_type: OptimizerType = MISSING  # adamw, sgd
     init_lr: float = MISSING
     end_lr: float = MISSING
@@ -47,6 +69,8 @@ class OptimizerConfig:
 
 @dataclass(unsafe_hash=True, eq=True)
 class AdamWOptimizerConfig(OptimizerConfig):
+    """外循环训练常用的 AdamW 配置。"""
+
     optimizer_type: OptimizerType = "adamw"
     init_lr: float = 0.0
     end_lr: float = 1e-5
@@ -63,6 +87,8 @@ class AdamWOptimizerConfig(OptimizerConfig):
 
 @dataclass(unsafe_hash=True, eq=True)
 class SGDOptimizerConfig(OptimizerConfig):
+    """内循环测试时训练常用的 SGD 配置。"""
+
     optimizer_type: OptimizerType = "sgd"
     lr: float = 0.01
     clip_gradient: float = 0.0
@@ -70,7 +96,14 @@ class SGDOptimizerConfig(OptimizerConfig):
 
 @dataclass(unsafe_hash=True, eq=True)
 class ModelConfig:
+    """Transformer 模型结构配置。
+
+    包含模型尺寸、注意力类型、RoPE、dropout、remat 和 E2E TTT 的 suffix/prime 设置。
+    """
+
     class SeqModelingBlockType(StrEnum):
+        """序列建模层类型。"""
+
         self_attention = "self_attention"
         SWA = "SWA"
 
@@ -120,12 +153,21 @@ class ModelConfig:
 
 @dataclass(unsafe_hash=True, eq=True)
 class TrainingConfig:
+    """训练过程配置。
+
+    这里同时描述数据、日志、checkpoint、外循环优化器和 E2E TTT 内循环优化器。
+    """
+
     class LoadPart(StrEnum):
+        """从 checkpoint 恢复哪些内容。"""
+
         all = "all"
         params = "params"
         none = "none"
 
     class TrainMode(StrEnum):
+        """训练模式：普通预训练或带内循环的 meta 训练。"""
+
         pretrain = "pretrain"
         meta = "meta"
 
@@ -162,6 +204,7 @@ class TrainingConfig:
     optimizer_inner: OptimizerConfig | None = field(default_factory=SGDOptimizerConfig)
     spec_outer: list[str] = field(default_factory=lambda: ["**"])
     spec_inner: list[str] = field(default_factory=lambda: ["**"])
+    # spec 使用点分路径和通配符来选择参数，例如 language_model.**.suffix_blocks.feed_forward_prime.**。
     "Specs are a list of dot-expressions with globs to index into the model. For instance, `['language_model.*.weight', 'language_model.**.bias]` would match every weight in every direct submodule of the language_model, and every bias parameter in the entire language_model."
     n_data_parallel: int | None = None  # Default to num_devices / n_state_parallel
     n_state_parallel: int = 1
@@ -172,8 +215,15 @@ class TrainingConfig:
 
 @dataclass(unsafe_hash=True, eq=True)
 class DeployPathsConfig:
+    """机器相关路径配置。
+
+    数据集和 checkpoint 路径通常不要写死在代码里，而是通过 deploy 配置注入。
+    """
+
     @dataclass(unsafe_hash=True, eq=True)
     class Data:
+        """各数据集名称到本地路径的映射。"""
+
         books3: str = MISSING
         the_pile: str = MISSING
 
@@ -183,6 +233,8 @@ class DeployPathsConfig:
 
 @dataclass(unsafe_hash=True, eq=True)
 class Config:
+    """Hydra 合并后的顶层配置对象。"""
+
     training: TrainingConfig = field(default_factory=TrainingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     backend: JaxDistributedConfig = field(default_factory=JaxDistributedConfig)
@@ -191,6 +243,8 @@ class Config:
 
 
 def register_configs():
+    """把 dataclass 注册给 Hydra，供 YAML defaults 引用。"""
+
     cs = ConfigStore.instance()
     cs.store(group="training", name="base_training", node=TrainingConfig)
     cs.store(group="model", name="base_model", node=ModelConfig)

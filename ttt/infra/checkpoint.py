@@ -1,3 +1,9 @@
+"""checkpoint 保存与恢复。
+
+Orbax 负责保存模型权重和优化器状态；这里额外实现了 Grain 数据迭代器的保存，
+这样恢复训练时可以继续从相同的数据进度往后跑。
+"""
+
 import dataclasses
 import json
 from copy import deepcopy
@@ -22,22 +28,26 @@ IteratorType = TypeVar("IteratorType", data_loader.DataLoaderIterator, dataset.D
 
 
 class CustomPyGrainCheckpointHandler(grain.PyGrainCheckpointHandler):
-    """Orbax CheckpointHandler for PyGrain iterators."""
+    """让 Orbax 能保存和恢复 PyGrain iterator 的自定义 handler。"""
 
     def save(
         self,
         directory: epath.Path,
         args: Any = None,
     ):
-        """Saves the given iterator to the checkpoint in `directory`."""
+        """把 iterator 的进度状态写成 JSON 文件。"""
+
         item = args.item
         if isinstance(item, dataset.DatasetIterator):
+            # MapDataset iterator 的状态本身就是 JSON 可序列化对象。
             state = json.dumps(item.get_state(), indent=4)
         else:
+            # DataLoaderIterator 返回 bytes，需要转成字符串存储。
             state = item.get_state().decode()
         filename = directory / "global_batch_progress.json"
 
         if jax.process_index() == 0:
+            # 多进程训练中只让主进程写这个小文件。
             filename.write_text(state)
 
     def restore(
@@ -45,7 +55,8 @@ class CustomPyGrainCheckpointHandler(grain.PyGrainCheckpointHandler):
         directory: epath.Path,
         args: Any = None,
     ) -> IteratorType:
-        """Restores the given iterator from the checkpoint in `directory`."""
+        """从 JSON 文件恢复 iterator 进度。"""
+
         item = args.item
         filename = directory / "global_batch_progress.json"
         if not filename.exists():
@@ -62,16 +73,25 @@ class CustomPyGrainCheckpointHandler(grain.PyGrainCheckpointHandler):
 @ocp.args.register_with_handler(CustomPyGrainCheckpointHandler, for_save=True)
 @dataclasses.dataclass
 class CustomPyGrainCheckpointSave(ocp.args.CheckpointArgs):
+    """保存 Grain iterator 时传给 Orbax 的参数容器。"""
+
     item: Any
 
 
 @ocp.args.register_with_handler(CustomPyGrainCheckpointHandler, for_restore=True)
 @dataclasses.dataclass
 class CustomPyGrainCheckpointRestore(ocp.args.CheckpointArgs):
+    """恢复 Grain iterator 时传给 Orbax 的参数容器。"""
+
     item: Any
 
 
 class Checkpointer:
+    """训练 checkpoint 管理器。
+
+    根据 `for_saving` 决定使用当前实验目录，还是使用 resume 实验目录。
+    """
+
     def __init__(self, config: Config, for_saving: bool = True):
         self.config = config
 
@@ -81,8 +101,10 @@ class Checkpointer:
             checkpoint_path = config.checkpoint.resume_checkpoint_dir
 
         if not checkpoint_path.startswith("gs://"):
+            # 本地路径转成绝对路径；GCS 路径保持 gs:// 形式。
             checkpoint_path = Path(checkpoint_path).resolve()
 
+        # 显式注册每个 item 的保存/恢复 handler。
         handler_registry = ocp.DefaultCheckpointHandlerRegistry()
         handler_registry.add("train_ds_iter", CustomPyGrainCheckpointRestore, CustomPyGrainCheckpointHandler)
         handler_registry.add("train_ds_iter", CustomPyGrainCheckpointSave, CustomPyGrainCheckpointHandler)
@@ -101,6 +123,8 @@ class Checkpointer:
         )
 
     def save_checkpoint(self, step: int, model: MetaModel, opt_state: OptState, train_ds_iter, is_milestone: bool = False):
+        """保存模型权重、优化器状态和训练数据迭代器进度。"""
+
         model_weights = model.weights()
 
         self.manager.save(
@@ -114,9 +138,16 @@ class Checkpointer:
         )
 
     def checkpoint_exists(self) -> bool:
+        """当前 checkpoint 目录下是否已经有可恢复的 step。"""
+
         return self.manager.latest_step() is not None
 
     def load_checkpoint(self, targets, restore: TrainingConfig.LoadPart, step=None):
+        """按 restore 策略恢复 checkpoint。
+
+        `params` 只恢复模型参数；`all` 会同时恢复优化器和数据迭代器。
+        """
+
         if step is None:
             step = self.manager.latest_step()
 
@@ -124,6 +155,7 @@ class Checkpointer:
             raise FileNotFoundError(f"No checkpoints found at {self.manager.directory}")
 
         model_weights_metadata = self.manager.item_metadata(step)["model_weights"]
+        # 根据当前模型结构补齐 Orbax restore target，并保持 shard/shape 信息。
         model_weights_target = fetch_from_eqx_module(model_weights_metadata, targets["model_weights"])[0]
 
         if restore == TrainingConfig.LoadPart.all:
@@ -155,9 +187,13 @@ class Checkpointer:
             raise ValueError(f"Invalid restore option: {restore:r}")
 
     def wait_until_finished(self):
+        """等待异步 checkpoint 写入完成。"""
+
         self.manager.wait_until_finished()
 
     def close(self):
+        """关闭 manager，并确保后台保存任务结束。"""
+
         self.manager.close()
 
 
@@ -166,7 +202,14 @@ def make_save_checkpoint(
     gather_fns,
     model_config,
 ):
+    """旧版保存函数包装器。
+
+    当前主训练循环直接使用 `Checkpointer.save_checkpoint`，这个函数保留给兼容旧调用方式。
+    """
+
     def save_checkpoint(train_state, train_loader, milestone=False, train_state_name=None):
+        """把旧版 train_state 格式保存成 checkpoint。"""
+
         step = int(jax.device_get(train_state["step"]))
         metadata = dict(step=step, model_config=OmegaConf.to_container(model_config))
         sampler_state_dict = {
@@ -190,17 +233,16 @@ M = TypeVar("M", bound=eqx.Module)
 
 
 def unify_dict_with_eqx_module[M: eqx.Module](d: dict, module: M) -> tuple[M, list[str]]:
-    """
-    Create an Equinox module from the data in dictionary `d`, relying on the structure being the same (although the key type might differ).
-    Values missing in the dictionary will be taken from the module.
+    """把 checkpoint 字典里的值填回 Equinox module。
+
+    checkpoint 和 module 的树结构应基本一致；找不到的值会保留 module 原值。
 
     Args:
-        d: Dictionary of weights to unify with the module.
-        module: Equinox module to unify with.
+        d: Orbax 恢复出来的权重字典。
+        module: 当前代码创建出的 Equinox module。
 
     Returns:
-        new_module: The module with weights from `d` when they are found, otherwise using the original weights.
-        not_found_paths: List of paths to weights that were not found in the dictionary.
+        填入 checkpoint 值后的 module，以及没有匹配到的路径。
     """
     from jax._src.lib import pytree
 
@@ -209,6 +251,7 @@ def unify_dict_with_eqx_module[M: eqx.Module](d: dict, module: M) -> tuple[M, li
     not_found_paths = []
 
     def find_weight(path, value):
+        # Orbax 字典路径使用 DictKey，Equinox module 路径使用 GetAttrKey，需要互相转换。
         dict_path = tuple(pytree.DictKey(p.name) if isinstance(p, pytree.GetAttrKey) else p for p in path)
         if dict_path in weights_map:
             return weights_map[dict_path]
@@ -227,9 +270,8 @@ def unify_dict_with_eqx_module[M: eqx.Module](d: dict, module: M) -> tuple[M, li
 
 
 def fetch_from_eqx_module[M: eqx.Module](d: dict, module: M) -> tuple[M, list[str]]:
-    """
-    Fetch values from the module and put them in the dictionary `d`.
-    """
+    """按 checkpoint 元数据结构，从当前 module 中取出 restore target。"""
+
     from jax._src.lib import pytree
 
     eqx_map = {p: v for p, v in jax.tree.flatten_with_path(module)[0]}  # list -> dict: {keypath: array}
@@ -237,6 +279,7 @@ def fetch_from_eqx_module[M: eqx.Module](d: dict, module: M) -> tuple[M, list[st
     not_found_paths = []
 
     def find_weight(path, value):
+        # 这里方向和 unify 相反：把 DictKey 转成 GetAttrKey 后去当前 module 里查。
         dict_path = tuple(pytree.GetAttrKey(p.key) if isinstance(p, pytree.DictKey) else p for p in path)
         if dict_path in eqx_map:
             new_value = eqx_map[dict_path]

@@ -1,3 +1,9 @@
+"""训练入口。
+
+这个文件把配置、数据、模型、优化器、checkpoint、W&B 和 JAX 分布式训练串起来。
+真正的单步训练逻辑在 `ttt.model.loop.train_on_sequence`。
+"""
+
 import logging
 import os
 from pathlib import Path
@@ -31,7 +37,10 @@ logger.setLevel(logging.INFO)
 
 
 def _prepare_data_parallelism(cfg: Config, global_dev_num: int) -> int:
+    """根据总设备数和 state parallel 数量推导 data parallel 数量。"""
+
     if cfg.training.n_data_parallel is None:
+        # 默认把除 state parallel 之外的设备都用于 data parallel。
         assert global_dev_num % cfg.training.n_state_parallel == 0, "Number of devices must be divisible by state parallelism"
         cfg.training.n_data_parallel = global_dev_num // cfg.training.n_state_parallel
     assert cfg.training.n_data_parallel * cfg.training.n_state_parallel == global_dev_num, (
@@ -41,6 +50,8 @@ def _prepare_data_parallelism(cfg: Config, global_dev_num: int) -> int:
 
 
 def _make_train_iterator(cfg: Config, model_cfg, data_sharding: jax.sharding.Sharding, n_data_parallel: int):
+    """创建训练数据 iterator，并提供把本地 batch 放到全局 sharding 上的函数。"""
+
     train_ds = (
         lm_dataset(
             path=cfg.training.dataset_path,
@@ -63,9 +74,11 @@ def _make_train_iterator(cfg: Config, model_cfg, data_sharding: jax.sharding.Sha
     )
 
     def load_to_sharded_array(arr):
+        # 每个 host 先拿到自己的 local batch，再拼成全局 batch 的 sharded array。
         return jax.make_array_from_process_local_data(sharding=data_sharding, local_data=arr, global_shape=(cfg.training.global_batch_size, *arr.shape[1:]))
 
     def to_sharded_batch(batch):
+        # 先搬到 data sharding，再把 batch 维整理成 [data_parallel, per_device_batch, ...]。
         batch = jax.tree.map(lambda x: load_to_sharded_array(x), batch)
         return tree_rearrange(batch, "(data_parallel batch) ... -> data_parallel batch ...", data_parallel=n_data_parallel)
 
@@ -76,6 +89,8 @@ def _make_train_iterator(cfg: Config, model_cfg, data_sharding: jax.sharding.Sha
 
 
 def _main(cfg: Config) -> None:
+    """训练主函数，接收 Hydra 合并后的配置。"""
+
     cfg_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
     logger.info("\n".join([f"{k}={v}" for k, v in os.environ.items()]))
     logger.info(f"Launching with \n {pformat(cfg_dict)}.")
@@ -85,6 +100,7 @@ def _main(cfg: Config) -> None:
 
     initialize_distibuted(backend_cfg)
 
+    # 统一随机种子，保证模型初始化和随机数据调试可复现。
     key = set_random_seed(cfg.training.model_seed)
 
     n_host = jax.process_count()
@@ -95,6 +111,7 @@ def _main(cfg: Config) -> None:
 
     n_data_parallel = _prepare_data_parallelism(cfg, global_dev_num)
 
+    # 每个实验的日志和 checkpoint 都放在 exp_dir/exp_folder/exp_name 下。
     log_dir = Path(cfg.training.exp_dir) / cfg.training.exp_folder / cfg.training.exp_name
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,10 +132,12 @@ def _main(cfg: Config) -> None:
 
     checkpointer = Checkpointer(config=cfg, for_saving=True)
 
+    # 外循环优化器负责更新模型初始化参数。
     optimizer_outer_loop, optimizer_info_outer_loop = make_optimizer(cfg.training.optimizer_outer)
 
     model_sharding = ModelSharding(cfg)
     mesh = model_sharding.mesh
+    # 训练 batch 按 data 轴切分，模型参数按 ModelSharding 里的规则切分。
     data_sharding = jax.NamedSharding(mesh, P("data"))
     cfg.model.seq_len = cfg.training.seq_length
 
@@ -126,6 +145,8 @@ def _main(cfg: Config) -> None:
 
     @eqx.filter_jit
     def create_sharded_model_and_state() -> tuple[MetaModel, eqx.nn.State]:
+        """创建模型和 Equinox state，并把参数放到目标 sharding 上。"""
+
         model, state = eqx.nn.make_with_state(MetaModel)(cfg, key=key)
         state = jax.device_put(state, jax.NamedSharding(mesh, P()))  # Replicate initial (empty) state
         model = model_sharding.shard_params(model)
@@ -136,6 +157,7 @@ def _main(cfg: Config) -> None:
         """
         Create optimizer state with correct sharding after having a single update step applied.
         """
+        # 先执行一次假的 update，让 Optax 内部状态拥有和真实训练相同的结构与 sharding。
         trainable_params = model.trainable_parameters()
         opt_state = optimizer_outer_loop.init(trainable_params)
         _, opt_state = optimizer_outer_loop.update(trainable_params, opt_state, model.trainable_parameters())
@@ -145,6 +167,9 @@ def _main(cfg: Config) -> None:
     continued_run = wandb_logger.preexisting
     master_log(logger, f"Wandb preexisting: {continued_run}")
     if (continued_run and checkpointer.checkpoint_exists()) or cfg.training.load_part != "none":
+        # 两种恢复路径：
+        # 1. 同名 W&B run 和当前 checkpoint 都存在，认为是继续训练；
+        # 2. 用户显式设置 load_part，从 resume_checkpoint_dir 加载参数或完整状态。
         if continued_run and checkpointer.checkpoint_exists():
             load_part = "all"  # Resuming from the current checkpointing directory requires the optimizer and loop state
             load_checkpointer = checkpointer
@@ -156,8 +181,10 @@ def _main(cfg: Config) -> None:
             )  # Use the resumption path only if the run is starting from scratch. Otherwise use the current checkpointing path.
 
         if load_part == "all" and cfg.training.eval_mode:  # prevent uncessary opt and loop state resumption
+            # 只做评估时不需要恢复优化器和数据迭代器。
             load_part = "params"
 
+        # Orbax restore 需要目标 pytree 的 shape 和 sharding 信息。
         abstract_model_weights = eval_shape_and_sharding(lambda: create_sharded_model_and_state()[0].weights())
         abstract_opt_state = eval_shape_and_sharding(lambda: create_stepped_opt_state(create_sharded_model_and_state()[0]))
 
@@ -168,6 +195,8 @@ def _main(cfg: Config) -> None:
         )
 
         def load_model_weights(model: MetaModel, out_state) -> MetaModel:
+            """把 checkpoint 权重填回当前代码构造出的模型结构。"""
+
             model_loaded = unify_dict_with_eqx_module(out_state["model_weights"], model)[0]
             return model_loaded
 
@@ -177,12 +206,15 @@ def _main(cfg: Config) -> None:
 
         if "opt_state" not in out_state:  # Create new optimizer state
             master_log(logger, "Restored model weights, creating new optimizer state")
+            # 只加载参数时，优化器状态从当前模型重新初始化。
             opt_state = optimizer_outer_loop.init(model.trainable_parameters())
             start_step = 0
 
         else:  # Restore optimizer state
 
             def create_opt_state_with_loaded_weights(model: MetaModel, out_state) -> OptState:
+                """创建带正确结构的优化器状态，再填入 checkpoint 值。"""
+
                 opt_state = create_stepped_opt_state(model)
                 opt_state = unify_dict_with_eqx_module(out_state["opt_state"], opt_state)[0]
                 return opt_state
@@ -194,11 +226,13 @@ def _main(cfg: Config) -> None:
         del out_state, load_checkpointer
 
     else:  # Create new model and optimizer state
+        # 没有恢复需求时，从随机初始化开始训练。
         model, state = create_sharded_model_and_state()
         opt_state = optimizer_outer_loop.init(model.trainable_parameters())  # Sharding taken from model
         start_step = 0
 
     ### Include Storage
+    # 统计参数量，只作为日志信息，不参与训练。
     num_trainable_params = sum(x.size for x in jax.tree_util.tree_leaves(model.trainable_parameters()))
     num_non_embedding_params = num_trainable_params - model.language_model.model.wte.weight.size
     if model.language_model.lm_head is not None:
@@ -221,6 +255,7 @@ def _main(cfg: Config) -> None:
 
     with mesh:
         if cfg.training.eval_mode or start_step == total_steps:
+            # eval_mode 或训练已经完成时，只跑评估并退出。
             state = state.set(model.step_index, jnp.array(jnp.iinfo(jnp.int32).max - 100, dtype=jnp.int32))
             evaluator.eval_fn(model, state, start_step)
             jax.experimental.multihost_utils.sync_global_devices("eval finished")
@@ -229,11 +264,13 @@ def _main(cfg: Config) -> None:
         tqdm = get_custom_tqdm() if master_process else _tqdm
         for step in tqdm(range(start_step, total_steps), initial=start_step, total=total_steps, desc="Outer Loop Training", disable=not master_process):
             if 0 < cfg.training.break_step < step:
+                # break_step 用于集群调试，方便在指定 step 后主动退出。
                 jax.experimental.multihost_utils.sync_global_devices("reached break step")
                 break
 
             batch = to_sharded_batch(next(train_ds_iter))
 
+            # step_index 会被内循环学习率 warmup 使用。
             state = state.set(model.step_index, jnp.array(step, dtype=jnp.int32))
             model, opt_state, loss, metrics = train_on_sequence(state, model, opt_state, batch, cfg)
             loss_ce = metrics[M.loss].mean()
@@ -250,6 +287,7 @@ def _main(cfg: Config) -> None:
                 master_log(logger, f"Saving checkpoint at step {step}, do not kill...")
                 is_milestone = (cfg.training.save_milestone_freq > 0) and (step % cfg.training.save_milestone_freq == 0)
 
+                # 保存模型、优化器和数据迭代器，确保中断后可以继续训练。
                 checkpointer.save_checkpoint(
                     step=step,
                     model=model,
@@ -262,6 +300,7 @@ def _main(cfg: Config) -> None:
                 checkpointer.wait_until_finished()
 
                 if step == cfg.training.total_steps - 1:
+                    # 最后一个 step 保存完成后跑一次评估。
                     evaluator.eval_fn(model, state, step)
 
         checkpointer.close()  # Always wait until checkpoints are done saving
@@ -272,9 +311,12 @@ def _main(cfg: Config) -> None:
 
 @hydra.main(version_base=None, config_path=str(Path("configs").absolute().resolve()), config_name="config")
 def main(cfg: Config):
+    """Hydra 命令行入口。"""
+
     if cfg.backend.compilation_cache_dir is not None:
         import jax
 
+        # JAX 编译缓存可以显著减少重复启动实验时的编译时间。
         jax.config.update("jax_compilation_cache_dir", cfg.backend.compilation_cache_dir)
 
     _main(cfg)

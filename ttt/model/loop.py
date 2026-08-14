@@ -1,3 +1,8 @@
+"""训练和评估循环中的单步函数。
+
+`train.py` 负责外层 orchestration；本文件负责真正计算 loss、梯度、评估指标和参数更新。
+"""
+
 import logging
 from pathlib import Path
 
@@ -32,25 +37,25 @@ def eval_step_fn(
     seq: Batch,
     state: eqx.nn.State,
 ):
-    """
-    Get loss and token-wise NLL metrics for a single batch of data, reduced across all devices.
+    """评估一个 sharded batch，并在 data parallel 设备间求平均。
 
     Args:
-        meta_model: The model to evaluate.
-        batch: The batch to evaluate on.
+        meta_model: 要评估的模型。
+        seq: 单个 data parallel 分片上的 Batch。
+        state: Equinox 模型状态。
     """
 
+    # loss_for_sequence 处理单条序列；外层 filter_vmap 会把它应用到每个 data parallel 分片。
     loss, metrics = meta_model.loss_for_sequence(seq, state)  # Reduce over per-device batch
 
+    # 设备间同步指标，确保每个设备看到相同的评估结果。
     _avg_loss, avg_metrics = jax.lax.pmean((loss, metrics), axis_name="data_parallel")  # Reduce over devices
 
     return avg_metrics
 
 
 class Evaluator:
-    """
-    Contains data loading and evaluation logic + state.
-    """
+    """封装评估数据加载和评估结果记录。"""
 
     def __init__(
         self,
@@ -60,6 +65,7 @@ class Evaluator:
         wandb_logger: WandbLogger,
         log_dir: Path,
     ):
+        # 评估使用 eval_split，且不 shuffle、不 repeat，保证结果稳定可复现。
         self.train_holdout_loader = (
             lm_dataset(
                 path=config.training.dataset_path,
@@ -88,14 +94,21 @@ class Evaluator:
         self.log_dir = log_dir
 
     def eval_fn(self, model: MetaModel, state: eqx.nn.State, step: int):
+        """遍历评估集，汇总平均指标，并写入日志。"""
+
         pid = jax.process_index()  # 0 -- (n_host - 1)
 
+        # 目前只有一个 holdout loader，保留 dict 结构方便后续扩展更多评估集。
         loader_dict = {"train_holdout": self.train_holdout_loader}
 
         def load_to_sharded_array(arr):
+            """把当前 host 的本地数组放到全局 data sharding 上。"""
+
             return jax.make_array_from_process_local_data(sharding=self.data_sharding, local_data=arr, global_shape=(self.global_batch_size, *arr.shape[1:]))
 
         def eval_loader(path, ds: grain.MapDataset):
+            """评估单个 loader，并对所有 batch 的结果取平均。"""
+
             batch_loader = ds.to_iter_dataset().map(lambda batch: jax.tree.map(load_to_sharded_array, batch))
             loader_key = path[0].key
 
@@ -104,6 +117,7 @@ class Evaluator:
                 result = eval_step_fn(model, batch, state)
                 results.append(result)
 
+            # 每个 batch 得到一个指标 pytree，这里沿 batch 维求平均并搬回 NumPy。
             results_mean = jax.tree.map(lambda *x: np.asarray(jnp.mean(jnp.stack(x), axis=0, dtype=jnp.float32)), *results)
 
             return results_mean
@@ -113,6 +127,8 @@ class Evaluator:
         self.log_eval_results(eval_metrics, step)
 
     def log_eval_results(self, eval_metrics, step):
+        """把评估指标写到 W&B 和本地文件。"""
+
         for eval_name, v in eval_metrics.items():
             for metric_name, metric in v.items():
                 if metric_name == M.loss:
@@ -124,6 +140,7 @@ class Evaluator:
                     # Log to wandb and cache for other metrics
                     save_dir = self.log_dir / f"{eval_name}_{metric_name}.npy"
                     if metric_name == M.token_nll_loss:
+                        # token-level NLL 很长，额外保存成 npy，W&B 里只画图展示。
                         self.wandb_logger.log_token_nll_loss(metric, step, eval_name)
                     np.save(save_dir, metric)
                     self.wandb_logger.save(save_dir, self.log_dir)
@@ -134,17 +151,20 @@ class Evaluator:
 def train_on_sequence(
     state: nn.State, meta_model: MetaModel, opt_state: OptState, batch: Batch, cfg: Config
 ) -> tuple[MetaModel, OptState, jnp.ndarray, dict[MetaModel.MetricType, jnp.ndarray]]:
-    """
-    Train the model for a single step on a sequence.
+    """执行一个外循环训练 step。
+
+    这个函数在 data parallel 轴上 vmap，行为类似 pmap：
+    每个设备计算本地梯度，然后通过 `pmean` 聚合成全局平均梯度。
 
     Args:
-        outer_optimizer_mut: The optimizer to update with. The model weights and optimizer state are updated in-place.
-        batch: The batch to train on. Should be of shape [per_device_batch_size * accum_steps, T]
-        cfg: Full configuration.
+        state: Equinox 模型状态，包含当前 step 等状态值。
+        meta_model: 当前模型。
+        opt_state: 外循环优化器状态。
+        batch: 当前设备上的 batch，shape 约为 `[per_device_batch_size * accum_steps, T]`。
+        cfg: 完整训练配置。
 
     Returns:
-        loss: Current step computed loss.
-        metrics: Dict of metrics (MetricType: aggregated token-wise negative log likelihood loss and gradient norms)
+        更新后的模型、优化器状态、当前 loss 和指标字典。
     """
     M = MetaModel.MetricType
     seqlen = cfg.training.seq_length
@@ -154,23 +174,29 @@ def train_on_sequence(
         f"Gradient accumulation steps should divide the per-device batch size, got {batch.shape[0]=} !% {cfg.training.accum_steps=}"
     )
 
+    # 把 batch 第一维拆成 [accum, micro_batch]，后面逐个 micro-batch 累计梯度。
     batch = tree_rearrange(batch, "(accum batch) ... -> accum batch ...", accum=cfg.training.accum_steps)
 
     # MetaModel.loss_for_sequence computes the loss for a single sequence -- need to vmap and then mean to compute the loss for a batch
     loss_fn = lambda model, b: vmap_mean(lambda seq: MetaModel.loss_for_sequence(model, seq, state), b, axis_name="batch")  # Outputs a single loss value
 
+    # 对模型求 loss 和梯度，同时保留 metrics 作为 aux 返回。
     meta_grad_fn = lambda batch: eqx.filter_value_and_grad(loss_fn, has_aux=True)(meta_model, batch)
 
+    # 用在线均值做 gradient accumulation，减少中间梯度占用。
     meta_grad_fn = lambda batch, fun=meta_grad_fn: welfords_online_mean(fun, batch)  # Accumulate statistics and gradients
     (loss, metrics), grads_meta = meta_grad_fn(batch)
 
     # Aggregate across data parallel dim
+    # 所有 data parallel 设备取平均，得到真正用于更新的全局梯度。
     avg_loss, avg_metrics, avg_grads_meta = jax.lax.pmean((loss, metrics, grads_meta), axis_name="data_parallel")
 
+    # 按 spec_outer 再过滤一次，冻结参数不会进入 Optax update。
     avg_grads_meta = avg_grads_meta.trainable_parameters()  # Handle frozen parameter spec
     avg_outer_gnorm = global_norm_safe(avg_grads_meta)
     avg_metrics[M.outer_grad_norm] = avg_outer_gnorm
 
+    # 外循环优化器更新模型初始化参数。
     outer_tx, _ = make_optimizer(cfg.training.optimizer_outer)
     updates, opt_state = outer_tx.update(avg_grads_meta, opt_state, meta_model.trainable_parameters())
 

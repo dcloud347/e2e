@@ -1,3 +1,9 @@
+"""优化器构造函数。
+
+外循环通常使用 AdamW 更新模型初始化；E2E TTT 的内循环通常使用 SGD 更新少量 suffix/prime 参数。
+这里统一返回 Optax optimizer 和可用于日志的学习率调度信息。
+"""
+
 import re
 
 import jax.numpy as jnp
@@ -8,7 +14,13 @@ from ttt.utils.filter_utils import get_mask_fn
 
 
 def make_adamw_optimizer(config: AdamWOptimizerConfig, weight_decay_mask=None):
+    """创建 AdamW 优化器。
+
+    学习率采用 warmup + cosine decay。`emb_wd=False` 时会把词嵌入参数排除在 weight decay 之外。
+    """
+
     if config.lr == 0.0:
+        # lr 为 0 时直接固定为 0，常用于冻结或调试。
         learning_rate_schedule = optax.constant_schedule(0.0)
     else:
         learning_rate_schedule = optax.warmup_cosine_decay_schedule(
@@ -22,6 +34,7 @@ def make_adamw_optimizer(config: AdamWOptimizerConfig, weight_decay_mask=None):
     optimizer_info = dict(learning_rate_schedule=learning_rate_schedule)
 
     if not config.emb_wd:
+        # 参数路径里包含 wte 的权重是 token embedding，不做 weight decay。
         exclude_emb = lambda name: False if re.search("wte", name) else True  # no wd on word embedding
         weight_decay_mask = lambda params: get_mask_fn(exclude_emb, params)
     else:
@@ -43,6 +56,11 @@ def make_adamw_optimizer(config: AdamWOptimizerConfig, weight_decay_mask=None):
 
 
 def make_sgd_optimizer(config: SGDOptimizerConfig, ilr_multiplier: jnp.ndarray = None):
+    """创建 SGD 优化器。
+
+    `ilr_multiplier` 用于内循环学习率 warmup，把配置里的 lr 乘上一个动态倍率。
+    """
+
     learning_rate_schedule = optax.constant_schedule(config.lr * ilr_multiplier)
     optimizer_info = dict(learning_rate_schedule=learning_rate_schedule)
     if config.clip_gradient > 0.0:
@@ -56,6 +74,8 @@ def make_sgd_optimizer(config: SGDOptimizerConfig, ilr_multiplier: jnp.ndarray =
 
 
 def make_optimizer(optimizer_config: OptimizerConfig, ilr_multiplier: jnp.ndarray = None) -> tuple[optax.GradientTransformation, dict]:
+    """根据配置分发到具体优化器构造函数。"""
+
     if optimizer_config.optimizer_type == "adamw":
         del ilr_multiplier
         optimizer, optimizer_info = make_adamw_optimizer(optimizer_config)
