@@ -2,13 +2,21 @@ defaults:
   - base_model
 
 name: 125m
-vocab_size: 128256
-bos_token_id: 128000
-eos_token_id: 128001
-num_hidden_layers: 12
-hidden_size: 768
-num_attention_heads: 12
-intermediate_size: 2048
-initializer_range: 0.02
-rms_norm_eps: 1e-6
-tie_word_embeddings: True
+
+# --- Tokenizer ---
+vocab_size: 128256       # 词表大小，与 Llama-3 tokenizer 对齐
+bos_token_id: 128000     # 序列开始 token 的 id
+eos_token_id: 128001     # 序列结束 token 的 id
+
+# --- 模型结构 ---
+num_hidden_layers: 12    # Transformer block 的层数
+hidden_size: 768         # 每层的隐层维度（embedding 维度）
+num_attention_heads: 12  # 注意力头数，每头维度 = hidden_size / num_attention_heads = 64
+intermediate_size: 2048  # SwiGLU FFN 的中间层维度（E2E 实验会在 experiment config 里覆盖为 1664）
+
+# --- 初始化与归一化 ---
+initializer_range: 0.02  # 权重初始化的正态分布标准差
+rms_norm_eps: 1e-6       # RMSNorm 分母的稳定项，防止除零
+
+# --- Embedding ---
+tie_word_embeddings: True  # 输入 embedding 和 lm_head 共享权重，减少参数量
