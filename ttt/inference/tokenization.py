@@ -91,6 +91,18 @@ def encode_text(
     return np.asarray(token_ids, dtype=np.int32)
 
 
+def truncate_tokens(tokens: np.ndarray, *, max_length: int) -> np.ndarray:
+    """Keep the rightmost `max_length` tokens."""
+
+    if max_length < 1:
+        raise ValueError(f"max_length must be positive, got {max_length}.")
+
+    tokens = np.asarray(tokens, dtype=np.int32)
+    if len(tokens) <= max_length:
+        return tokens
+    return tokens[-max_length:]
+
+
 def read_text_input(*, text: str | None, text_file: str | None) -> str:
     """Read text from exactly one CLI input source."""
 
@@ -135,6 +147,47 @@ def tokens_to_lm_batch(
         valid = np.zeros(seq_len, dtype=bool)
         valid[: original_len - 1] = True
         loss_masks = loss_masks & valid
+
+    return Batch(
+        input_ids=input_ids.astype(np.int32),
+        target_tokens=target_tokens.astype(np.int32),
+        loss_masks=loss_masks,
+    )
+
+
+def tokens_to_prompt_batch(
+    tokens: np.ndarray,
+    *,
+    eos_token_id: int,
+    seq_len: int | None = None,
+    pad_token_id: int | None = None,
+) -> Batch:
+    """Convert prompt tokens to a conditioning batch for generation.
+
+    The full prompt is used as input. The last real target is a dummy EOS token and is masked out.
+    """
+
+    tokens = np.asarray(tokens, dtype=np.int32)
+    if tokens.ndim != 1:
+        raise ValueError(f"Expected a 1D token array, got shape {tokens.shape}.")
+    if len(tokens) < 1:
+        raise ValueError("Need at least one token to build a generation prompt batch.")
+    if seq_len is not None and seq_len < 1:
+        raise ValueError(f"seq_len must be positive, got {seq_len}.")
+    if seq_len is not None and len(tokens) > seq_len:
+        raise ValueError(f"Got {len(tokens)} prompt tokens for seq_len={seq_len}. Truncate before batching.")
+
+    pad_id = eos_token_id if pad_token_id is None else pad_token_id
+    batch_len = len(tokens) if seq_len is None else seq_len
+    input_ids = np.full(batch_len, pad_id, dtype=np.int32)
+    target_tokens = np.full(batch_len, pad_id, dtype=np.int32)
+    loss_masks = np.zeros(batch_len, dtype=bool)
+
+    input_ids[: len(tokens)] = tokens
+    if len(tokens) > 1:
+        target_tokens[: len(tokens) - 1] = tokens[1:]
+        loss_masks[: len(tokens) - 1] = True
+    target_tokens[len(tokens) - 1] = eos_token_id
 
     return Batch(
         input_ids=input_ids.astype(np.int32),

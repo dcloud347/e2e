@@ -694,6 +694,19 @@ class MetaModel(eqx.Module):
 
         pass
 
+    class AdaptResult(eqx.Module):
+        """Prompt/context adaptation result for inference paths."""
+
+        adapted_model: MetaModel
+        adapted_state: nn.State | tuple[nn.State, nn.State]
+        loss: jnp.ndarray
+        metrics: dict[MetaModel.MetricType, jnp.ndarray]
+
+        def __iter__(self):
+            """Allow `model, state, loss, metrics = result` unpacking."""
+
+            return iter((self.adapted_model, self.adapted_state, self.loss, self.metrics))
+
     class InnerLoopStepResult(eqx.Module):
         """一次内循环更新后的返回结构。"""
 
@@ -772,8 +785,78 @@ class MetaModel(eqx.Module):
 
         return loss, (loss_pure_ce, token_nll_loss, lm_outputs.new_state)
 
-    def loss_for_sequence(self, seq: Batch, state: nn.State) -> tuple[jnp.ndarray, dict[MetricType, jnp.ndarray]]:
-        """处理单条序列并返回 loss 和指标。
+    def next_token_logits_for_sequence(self, seq: Batch, state: nn.State, last_index: jnp.ndarray) -> jnp.ndarray:
+        """Return next-token logits at `last_index` without materializing all sequence logits.
+
+        This is intentionally a conservative full-prefix inference path: it recomputes the visible
+        context with the adapted model, then projects only the selected hidden state to vocabulary logits.
+        """
+
+        tokens_per_chunk = self.config.model.mini_batch_size
+        last_index = jnp.asarray(last_index, dtype=jnp.int32)
+
+        if isinstance(self.language_model.model.h, BlockCollectionSplit):
+            h = self.language_model.model.h
+            state_prefix = state.substate(h.prefix_blocks)
+
+            xt_embed = self.language_model.wte_call(seq.input_ids)
+            prefix_output = eqx.filter_checkpoint(self.language_model.prefix_call)(
+                h.prefix_blocks,
+                xt_embed,
+                state_prefix,
+                seq,
+            ).last_hidden_state
+
+            if h.suffix_blocks is None:
+                hidden_states = jax.vmap(self.language_model.model.ln_f)(prefix_output)
+                return self.language_model.wte_disembed_call(hidden_states[last_index])
+
+            state_suffix = state.substate(h.suffix_blocks)
+            seq_chunks = tree_rearrange(seq, "(chunk token) ... -> chunk token ...", token=tokens_per_chunk)
+            prefix_chunks = tree_rearrange(prefix_output, "(chunk token) ... -> chunk token ...", token=tokens_per_chunk)
+            chunk_indices = jnp.arange(seq.input_ids.shape[0] // tokens_per_chunk, dtype=jnp.int32)
+            last_chunk_index = last_index // tokens_per_chunk
+            last_token_index = last_index % tokens_per_chunk
+            init_logits = jnp.zeros((self.config.model.vocab_size,), dtype=self.compute_dtype)
+
+            def process_suffix_chunk(carry, inputs):
+                suffix_state, selected_logits = carry
+                chunk_index, suffix_chunk, prefix_chunk = inputs
+
+                def run_chunk(run_carry):
+                    run_state, run_logits = run_carry
+                    outputs: BaseModelOutput = self.language_model.model.suffix_call(prefix_chunk, state=run_state, seq=suffix_chunk)
+
+                    def select_logits(_):
+                        return self.language_model.wte_disembed_call(outputs.last_hidden_state[last_token_index])
+
+                    run_logits = jax.lax.cond(chunk_index == last_chunk_index, select_logits, lambda _: run_logits, operand=None)
+                    return outputs.state, run_logits
+
+                return jax.lax.cond(chunk_index <= last_chunk_index, run_chunk, lambda skip_carry: skip_carry, (suffix_state, selected_logits)), None
+
+            (_state_suffix, selected_logits), _ = scan_or_loop(
+                process_suffix_chunk,
+                (state_suffix, init_logits),
+                (chunk_indices, seq_chunks, prefix_chunks),
+                use_loop=self.config.model.unroll_inner_scan,
+            )
+            return selected_logits
+
+        outputs = self.language_model.model(
+            state,
+            seq,
+        )
+        return self.language_model.wte_disembed_call(outputs.last_hidden_state[last_index])
+
+    @staticmethod
+    def _flatten_sequence_metrics(metrics: dict[MetricType, jnp.ndarray]) -> dict[MetricType, jnp.ndarray]:
+        """Flatten chunk/token metrics to match the historical loss_for_sequence output."""
+
+        return jax.tree.map(lambda x: x if x.ndim == 1 else rearrange(x, "window data ... -> (window data) ..."), metrics)
+
+    def adapt_on_sequence(self, seq: Batch, state: nn.State) -> AdaptResult:
+        """Run the existing inner-loop sequence adaptation and return the final adapted model/state.
 
         meta 模式会复制模型权重做内循环更新，避免修改输入模型本身。
 
@@ -782,7 +865,7 @@ class MetaModel(eqx.Module):
             state: Equinox 模型状态。
 
         Returns:
-            序列 loss，以及包含 token-level NLL 等信息的指标字典。
+            适配后的模型/state、序列 loss，以及包含 token-level NLL 等信息的指标字典。
         """
         cfg = self.config
 
@@ -803,7 +886,7 @@ class MetaModel(eqx.Module):
         state_all = clone_pytree(state)
 
         # 临时把模型中的完整 BlockCollection 替换成拆分后的 BlockCollectionSplit。
-        self: MetaModel = eqx.tree_at(lambda m: m.language_model.model.h, self, new_collection)
+        split_model: MetaModel = eqx.tree_at(lambda m: m.language_model.model.h, self, new_collection)
 
         seqlen = cfg.training.seq_length
         tokens_per_chunk = cfg.model.mini_batch_size
@@ -814,13 +897,13 @@ class MetaModel(eqx.Module):
 
         if cfg.training.train_mode == "meta":
             # meta 模式中会在一条序列内部做 inner-loop TTT。
-            model: MetaModel = jax.tree.map(lambda p: p.astype(self.state_dtype), self)
+            model: MetaModel = jax.tree.map(lambda p: p.astype(split_model.state_dtype), split_model)
             inner_opt_state = model.inner_optimizer(state_all).init(model.inner_parameters())
 
             # prefix 对整条序列只算一次，得到每个 token 的 prefix hidden state。
-            xt_embed = self.language_model.wte_call(seq.input_ids)
-            prefix_output = eqx.filter_checkpoint(self.language_model.prefix_call)(
-                self.language_model.model.h.prefix_blocks, xt_embed, state_prefix, seq
+            xt_embed = split_model.language_model.wte_call(seq.input_ids)
+            prefix_output = eqx.filter_checkpoint(split_model.language_model.prefix_call)(
+                split_model.language_model.model.h.prefix_blocks, xt_embed, state_prefix, seq
             ).last_hidden_state
 
             def process_suffix_chunk(model__opt_state__state, inputs: tuple[Batch, jnp.ndarray]):
@@ -830,7 +913,7 @@ class MetaModel(eqx.Module):
                 suffix_chunk, prefix_chunk = inputs
 
                 # 内循环参数来自已经更新过的 model_inner，外循环参数保持原始 model。
-                spec_inner = get_filter_spec(model_inner, self.config.training.spec_inner, "inner parameters")
+                spec_inner = get_filter_spec(model_inner, split_model.config.training.spec_inner, "inner parameters")
                 inner_params, _ = eqx.partition(model_inner, spec_inner)
                 _, outer_params = eqx.partition(model, spec_inner)
                 model_inner: MetaModel = eqx.combine(inner_params, outer_params)
@@ -854,6 +937,7 @@ class MetaModel(eqx.Module):
             )
 
             loss = metrics[M.loss].mean()
+            adapted_model, _inner_opt_state, adapted_state = carry
 
         elif cfg.training.train_mode == "pretrain":
             # pretrain 模式不做内循环，只按 chunk 顺序计算普通 LM loss。
@@ -864,10 +948,10 @@ class MetaModel(eqx.Module):
             def process_one_window(state, seq_chunk):
                 """普通预训练模式下处理一个 chunk。"""
 
-                loss, (loss_pure_ce, token_nll_loss, state) = self.lm_loss(seq_chunk, state)
+                loss, (loss_pure_ce, token_nll_loss, state) = split_model.lm_loss(seq_chunk, state)
                 return state, (loss, loss_pure_ce, token_nll_loss)
 
-            _state, (loss, metrics[M.loss], metrics[M.token_nll_loss]) = scan_remat_chunk(
+            adapted_state, (loss, metrics[M.loss], metrics[M.token_nll_loss]) = scan_remat_chunk(
                 process_one_window,
                 (state_prefix, state_suffix),
                 seq,
@@ -875,13 +959,21 @@ class MetaModel(eqx.Module):
                 unroll=cfg.model.unroll_inner_scan,
             )
             loss = loss.mean()
+            adapted_model = split_model
 
         else:
             raise NotImplementedError(f"Training mode {cfg.training.train_mode} not implemented")
 
         # Flatten window into data dimension
         # 把 `[window, data, ...]` 合成 `[window * data, ...]`，方便后续日志和平均。
-        metrics = jax.tree.map(lambda x: x if x.ndim == 1 else rearrange(x, "window data ... -> (window data) ..."), metrics)
+        metrics = MetaModel._flatten_sequence_metrics(metrics)
+        return MetaModel.AdaptResult(adapted_model=adapted_model, adapted_state=adapted_state, loss=loss, metrics=metrics)
+
+    def loss_for_sequence(self, seq: Batch, state: nn.State) -> tuple[jnp.ndarray, dict[MetricType, jnp.ndarray]]:
+        """处理单条序列并返回 loss 和指标。"""
+
+        result = self.adapt_on_sequence(seq, state)
+        loss, metrics = result.loss, result.metrics
         return loss, metrics
 
     def weights(self):

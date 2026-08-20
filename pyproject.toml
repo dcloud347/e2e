@@ -33,6 +33,7 @@ dependencies = [
 [project.scripts]
 train = "ttt.train:main"
 ttt-text-eval = "ttt.inference.eval_text:main"
+ttt-generate = "ttt.inference.generate:main"
 
 [tool.setuptools.packages.find]
 include = ["ttt", "ttt.*", "hydra_plugins", "hydra_plugins.*"]

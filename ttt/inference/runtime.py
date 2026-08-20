@@ -139,3 +139,16 @@ def eval_text_batch(model: MetaModel, state: eqx.nn.State, batch: Batch):
 
     return model.loss_for_sequence(batch, state)
 
+
+@eqx.filter_jit
+def adapt_text_batch(model: MetaModel, state: eqx.nn.State, batch: Batch):
+    """Run inner-loop adaptation and return the adapted model/state."""
+
+    return model.adapt_on_sequence(batch, state)
+
+
+@eqx.filter_jit
+def next_token_logits(model: MetaModel, state: eqx.nn.State, batch: Batch, last_index: jnp.ndarray):
+    """Return vocabulary logits for the next token after `batch.input_ids[last_index]`."""
+
+    return model.next_token_logits_for_sequence(batch, state, last_index)
