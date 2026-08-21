@@ -149,6 +149,9 @@ class ModelConfig:
     pre_norm: bool = True
     post_norm: bool = True
     feed_forward_prime: str = "swiglu"  # Only "swiglu" is supported.
+    # Width of the dynamically updated prime FFN. None keeps the historical
+    # behavior and uses intermediate_size, so existing configs/checkpoints are unchanged.
+    prime_intermediate_size: int | None = None
 
 
 @dataclass(unsafe_hash=True, eq=True)

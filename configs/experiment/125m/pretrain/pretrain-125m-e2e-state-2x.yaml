@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - /experiment/125m/pretrain/pretrain-125m-e2e
+  - _self_
+
+training:
+  exp_name: pretrain-125m-e2e-state-2x
+
+model:
+  # Keep three dynamically updated suffix MLPs, but double the state held by
+  # each one. For a bias-free SwiGLU MLP, parameters per block are
+  # 3 * hidden_size * prime_intermediate_size.
+  suffix_len: 3
+  prime_intermediate_size: 3328

@@ -58,26 +58,24 @@ class SwiGLUMLP(eqx.Module):
         config: ModelConfig,
         *,
         key: PRNGKeyArray,
+        intermediate_size: int | None = None,
     ):
         """按模型配置初始化三组无 bias 线性层。"""
 
         self.config = config
         self.compute_dtype = get_float_dtype_by_name(self.config.compute_dtype)
         self.param_dtype = get_float_dtype_by_name(self.config.param_dtype)
+        intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        if intermediate_size <= 0:
+            raise ValueError(f"intermediate_size must be positive, got {intermediate_size}")
 
         w1_key, w2_key, w3_key = jrandom.split(key, 3)
 
-        self.w1 = NormalLinear(
-            self.config, in_features=config.hidden_size, out_features=config.intermediate_size, std=config.initializer_range, key=w1_key, name="w1"
-        )
+        self.w1 = NormalLinear(self.config, in_features=config.hidden_size, out_features=intermediate_size, std=config.initializer_range, key=w1_key, name="w1")
 
-        self.w2 = NormalLinear(
-            self.config, in_features=config.intermediate_size, out_features=config.hidden_size, std=config.initializer_range, key=w2_key, name="w2"
-        )
+        self.w2 = NormalLinear(self.config, in_features=intermediate_size, out_features=config.hidden_size, std=config.initializer_range, key=w2_key, name="w2")
 
-        self.w3 = NormalLinear(
-            self.config, in_features=config.hidden_size, out_features=config.intermediate_size, std=config.initializer_range, key=w3_key, name="w3"
-        )
+        self.w3 = NormalLinear(self.config, in_features=config.hidden_size, out_features=intermediate_size, std=config.initializer_range, key=w3_key, name="w3")
 
         self.dropout = nn.Dropout(p=self.config.resid_pdrop)
 
@@ -118,7 +116,8 @@ class PrimeStorage(eqx.Module):
         if config.feed_forward_prime != "swiglu":
             raise NotImplementedError("Only feed_forward_prime='swiglu' is supported.")
 
-        self.feed_forward_prime = jax.vmap(lambda k: SwiGLUMLP(config, key=k))(suffix_keys)
+        prime_intermediate_size = config.prime_intermediate_size if config.prime_intermediate_size is not None else config.intermediate_size
+        self.feed_forward_prime = jax.vmap(lambda k: SwiGLUMLP(config, key=k, intermediate_size=prime_intermediate_size))(suffix_keys)
         self.ffn_prime_norm = jax.vmap(lambda _: nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_bias=False, dtype=param_dtype))(suffix_keys)
         self.ffn_prime_post_norm = jax.vmap(lambda _: nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_bias=False, dtype=param_dtype))(suffix_keys)
 
